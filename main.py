@@ -9,7 +9,34 @@ def sanitize_filename(filename):
     """파일명으로 사용할 수 없는 문자를 제거합니다."""
     return re.sub(r'[\\/*?:"<>|]', "", filename)
 
-def split_pdf_by_chapters(input_path, log_callback=None):
+def get_pdf_chapters(input_path):
+    """PDF에서 최상위 챕터 목록을 추출합니다."""
+    if not os.path.exists(input_path):
+        return []
+    try:
+        doc = fitz.open(input_path)
+        toc = doc.get_toc()
+        chapters = []
+        for i, entry in enumerate(toc):
+            if entry[0] == 1:
+                level, title, start_page = entry[:3]
+                # 다음 챕터의 시작 페이지를 찾아 현재 챕터의 끝 페이지 계산
+                end_page = doc.page_count
+                for next_entry in toc[i+1:]:
+                    if next_entry[0] == 1:
+                        end_page = next_entry[2] - 1
+                        break
+                chapters.append({
+                    "title": title,
+                    "start_page": start_page,
+                    "end_page": end_page
+                })
+        doc.close()
+        return chapters
+    except Exception:
+        return []
+
+def split_pdf_by_chapters(input_path, selected_indices=None, log_callback=None):
     if not os.path.exists(input_path):
         msg = f"Error: File not found - {input_path}"
         if log_callback: log_callback(msg)
@@ -24,55 +51,49 @@ def split_pdf_by_chapters(input_path, log_callback=None):
         else: print(msg)
         return
 
-    toc = doc.get_toc()  # [[lvl, title, page, ...], ...]
+    toc = doc.get_toc()
+    chapters_info = []
+    for i, entry in enumerate(toc):
+        if entry[0] == 1:
+            level, title, start_page = entry[:3]
+            end_page = doc.page_count
+            for next_entry in toc[i+1:]:
+                if next_entry[0] == 1:
+                    end_page = next_entry[2] - 1
+                    break
+            chapters_info.append((title, start_page, end_page))
 
-    if not toc:
-        msg = "No table of contents found in the PDF."
-        if log_callback: log_callback(msg)
-        else: print(msg)
-        doc.close()
-        return
-
-    # 최상위 챕터(level 1)만 필터링
-    chapters = [entry for entry in toc if entry[0] == 1]
-
-    if not chapters:
+    if not chapters_info:
         msg = "No top-level chapters (level 1) found."
         if log_callback: log_callback(msg)
         else: print(msg)
         doc.close()
         return
 
+    # 선택된 인덱스가 있으면 해당 챕터만 필터링
+    if selected_indices is not None:
+        chapters_to_process = [chapters_info[i] for i in selected_indices if i < len(chapters_info)]
+    else:
+        chapters_to_process = chapters_info
+
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     output_dir = os.path.dirname(input_path)
     if not output_dir:
         output_dir = "."
     
-    # 원본 파일 이름의 하위 디렉토리 생성
     output_subdir = os.path.join(output_dir, base_name)
     if not os.path.exists(output_subdir):
         os.makedirs(output_subdir)
         if log_callback: log_callback(f"디렉토리 생성: {output_subdir}")
 
     count = 0
-    for i, chapter in enumerate(chapters):
-        level, title, start_page = chapter[:3]
-        
-        # 마지막 챕터인 경우 문서의 끝까지, 아니면 다음 챕터의 시작 페이지 전까지
-        if i < len(chapters) - 1:
-            end_page = chapters[i+1][2] - 1
-        else:
-            end_page = doc.page_count
-
-        # doc.get_toc()에서 반환되는 페이지 번호는 1-based입니다.
-        # fitz의 insert_pdf 등에서 사용하는 인덱스는 0-based입니다.
+    for title, start_page, end_page in chapters_to_process:
         start_idx = start_page - 1
         end_idx = end_page - 1
 
         if start_idx < 0: start_idx = 0
         if end_idx >= doc.page_count: end_idx = doc.page_count - 1
         
-        # 유효한 페이지 범위인지 확인
         if start_idx > end_idx:
             msg = f"Skipping chapter '{title}': invalid page range ({start_page} to {end_page})"
             if log_callback: log_callback(msg)
@@ -107,34 +128,66 @@ class PDFSplitterGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF Chapter Splitter")
-        self.root.geometry("600x400")
+        self.root.geometry("700x600")
 
         # 파일 선택 섹션
-        self.file_frame = tk.Frame(root, pady=20)
+        self.file_frame = tk.Frame(root, pady=10)
         self.file_frame.pack(fill=tk.X)
 
-        self.file_label = tk.Label(self.file_frame, text="선택된 파일: 없음", wraplength=500)
+        self.file_label = tk.Label(self.file_frame, text="선택된 파일: 없음", wraplength=600)
         self.file_label.pack(side=tk.TOP, pady=5)
 
         self.select_button = tk.Button(self.file_frame, text="PDF 파일 선택", command=self.select_file)
         self.select_button.pack(side=tk.TOP)
 
-        # 로그 영역
-        self.log_frame = tk.Frame(root, padx=10, pady=10)
-        self.log_frame.pack(fill=tk.BOTH, expand=True)
+        # 챕터 선택 섹션
+        self.chapter_frame = tk.LabelFrame(root, text="분할할 챕터 선택", padx=10, pady=10)
+        self.chapter_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        self.log_text = tk.Text(self.log_frame, state=tk.DISABLED, height=10)
+        # 체크박스 리스트를 위한 캔버스와 스크롤바
+        self.canvas = tk.Canvas(self.chapter_frame)
+        self.scrollbar_v = tk.Scrollbar(self.chapter_frame, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = tk.Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar_v.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar_v.pack(side="right", fill="y")
+
+        # 전체 선택/해제 버튼
+        self.btn_frame = tk.Frame(root)
+        self.btn_frame.pack(fill=tk.X, padx=10)
+        
+        self.select_all_btn = tk.Button(self.btn_frame, text="전체 선택", command=self.select_all, state=tk.DISABLED)
+        self.select_all_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.deselect_all_btn = tk.Button(self.btn_frame, text="전체 해제", command=self.deselect_all, state=tk.DISABLED)
+        self.deselect_all_btn.pack(side=tk.LEFT, padx=5)
+
+        # 로그 영역
+        self.log_frame = tk.LabelFrame(root, text="로그", padx=10, pady=5)
+        self.log_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.log_text = tk.Text(self.log_frame, state=tk.DISABLED, height=8)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.scrollbar = tk.Scrollbar(self.log_frame, command=self.log_text.yview)
-        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.config(yscrollcommand=self.scrollbar.set)
+        self.scrollbar_log = tk.Scrollbar(self.log_frame, command=self.log_text.yview)
+        self.scrollbar_log.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.config(yscrollcommand=self.scrollbar_log.set)
 
         # 실행 버튼
         self.run_button = tk.Button(root, text="분할 시작", command=self.run_split, state=tk.DISABLED, height=2, width=20)
         self.run_button.pack(pady=10)
 
         self.selected_file = None
+        self.chapters = []
+        self.chapter_vars = []
 
     def select_file(self):
         file_path = filedialog.askopenfilename(
@@ -144,8 +197,47 @@ class PDFSplitterGUI:
         if file_path:
             self.selected_file = file_path
             self.file_label.config(text=f"선택된 파일: {os.path.basename(file_path)}")
-            self.run_button.config(state=tk.NORMAL)
-            self.log_message(f"파일이 선택되었습니다: {file_path}")
+            self.load_chapters(file_path)
+
+    def load_chapters(self, file_path):
+        # 기존 체크박스 제거
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        
+        self.chapters = get_pdf_chapters(file_path)
+        self.chapter_vars = []
+
+        if not self.chapters:
+            self.log_message("목차를 찾을 수 없거나 최상위 챕터가 없습니다.")
+            self.run_button.config(state=tk.DISABLED)
+            self.select_all_btn.config(state=tk.DISABLED)
+            self.deselect_all_btn.config(state=tk.DISABLED)
+            return
+
+        for i, chap in enumerate(self.chapters):
+            var = tk.BooleanVar(value=True)
+            self.chapter_vars.append(var)
+            cb = tk.Checkbutton(
+                self.scrollable_frame, 
+                text=f"{chap['title']} (P.{chap['start_page']} ~ P.{chap['end_page']})", 
+                variable=var,
+                anchor="w",
+                justify=tk.LEFT
+            )
+            cb.pack(fill=tk.X, anchor="w")
+
+        self.run_button.config(state=tk.NORMAL)
+        self.select_all_btn.config(state=tk.NORMAL)
+        self.deselect_all_btn.config(state=tk.NORMAL)
+        self.log_message(f"총 {len(self.chapters)}개의 챕터를 찾았습니다.")
+
+    def select_all(self):
+        for var in self.chapter_vars:
+            var.set(True)
+
+    def deselect_all(self):
+        for var in self.chapter_vars:
+            var.set(False)
 
     def log_message(self, message):
         self.log_text.config(state=tk.NORMAL)
@@ -158,12 +250,18 @@ class PDFSplitterGUI:
         if not self.selected_file:
             return
 
+        selected_indices = [i for i, var in enumerate(self.chapter_vars) if var.get()]
+        
+        if not selected_indices:
+            messagebox.showwarning("경고", "분할할 챕터를 하나 이상 선택해 주세요.")
+            return
+
         self.run_button.config(state=tk.DISABLED)
         self.select_button.config(state=tk.DISABLED)
         
         self.log_message("\n작업을 시작합니다...")
         try:
-            split_pdf_by_chapters(self.selected_file, self.log_message)
+            split_pdf_by_chapters(self.selected_file, selected_indices, self.log_message)
             messagebox.showinfo("완료", "PDF 분할 작업이 완료되었습니다.")
         except Exception as e:
             self.log_message(f"오류 발생: {e}")
